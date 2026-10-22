@@ -8,13 +8,13 @@ The two builds, an Android app and a Spring Boot API server, ran under three exi
 - **Enhanced**: `gradle/actions/setup-gradle` v6 with its default provider, the closed-source `gradle-actions-caching` library.
 - **v5**: `gradle/actions/setup-gradle` v5.0.2, the last release whose fine-grained caching is open source (MIT).
 
-A fourth variant, **sim**, roughly models the ideal design on top of v5, to test its main claims.
+A fourth variant, **sim**, adds parts of the ideal design to v5 to test its main claims.
 
-There is no implementation. The ideal design is a reference point for the measurements, not a product. The measurement harness is [gradle-cache-harness](https://github.com/ryanlewis/gradle-cache-harness).
+There is no implementation. The ideal design is a reference point for the measurements. The measurement harness is [gradle-cache-harness](https://github.com/ryanlewis/gradle-cache-harness).
 
 ## Contents
 
-- [Summary](#summary)
+- [Findings, ranked by measured value](#findings-ranked-by-measured-value)
 - [Ideal design](#ideal-design)
 - [What can be cached](#what-can-be-cached)
 - [Mechanics of each layer](#mechanics-of-each-layer)
@@ -26,12 +26,10 @@ There is no implementation. The ideal design is a reference point for the measur
 - [Open questions](#open-questions)
 - [Sources](#sources)
 
-## Summary
-
-Ranked by measured value on the two builds:
+## Findings, ranked by measured value
 
 1. **Restore fallback for Gradle User Home.** After a build-file or version-catalogue edit, a cache keyed on build files (basic) starts empty. That costs about 7 minutes on the Android build and about 5.5 minutes on the Spring Boot build. Falling back to the nearest earlier entry costs 40–90 seconds.
-2. **Task outputs in their own store, not in Gradle User Home.** Per-job cleanup of Gradle User Home deletes task outputs the current job didn't use. Switching back to an earlier dependency set then rebuilds work that had already been cached. A separate content-addressed store, expired by age, keeps it. *sim* confirmed this: 316 tasks from cache, against 302 for v5 and Enhanced.
+2. **Task outputs in their own store, not in Gradle User Home.** Per-job cleanup of Gradle User Home deletes task outputs the current job didn't use. Switching back to an earlier dependency set then rebuilds work that had already been cached. A separate content-addressed store, expired by age, keeps it. *sim* confirmed this on Android: going back to the original versions, it got 316 tasks from cache, against 302 for v5 and Enhanced.
 3. **Fine-grained, content-addressed entries.** A one-library bump added 10 MB of new dependency and transform files on Android. v5 and Enhanced re-uploaded 940 MB of bundles.
 4. **Project state for the configuration cache.** The configuration cache is reused across commits, including source-only edits, but only if three things hold:
    - the runner image is the same;
@@ -135,7 +133,7 @@ sequenceDiagram
 gradle-home-v1|<os>-<arch>|<job>[<hash(workflow, matrix)>]-<sha>
 ```
 
-Restore tries the exact key, then the most recent entry for the same job and matrix, then the same job, then the same OS, each on the current branch first and then the default branch. On S3, the ideal design writes a small pointer object per scope on every save. Restore is then a short chain of `GetObject` calls instead of prefix listing.
+Restore tries the exact key first. It then falls back to the most recent entry for the same job and matrix, then the same job, then the same OS. Each level is tried on the current branch, then the default branch. On S3, the ideal design writes a small pointer object per scope on every save, so restore is a short chain of `GetObject` calls with no prefix listing.
 
 **Extracted entries.** These are the definitions in the v5 code (Enhanced creates the same set, plus the local build cache):
 
@@ -324,7 +322,7 @@ Enhanced's Gradle User Home caching is the v5 design with the protocol bumped to
 
 ## Measurements
 
-The [harness](https://github.com/ryanlewis/gradle-cache-harness) builds two public projects at pinned commits on GitHub-hosted `ubuntu-24.04` runners. Every provider observed from outside only: step timings, cache entries, Gradle User Home contents before and after, build operation traces, and DNS lookups and connections. The closed library was not unpacked.
+The [harness](https://github.com/ryanlewis/gradle-cache-harness) builds two public projects at pinned commits on GitHub-hosted `ubuntu-24.04` runners. It observes each provider from outside only: step timings, cache entries, Gradle User Home contents before and after, build operation traces, and DNS lookups and connections. The closed library is never unpacked.
 
 | Build | Shape | Commands |
 |---|---|---|
