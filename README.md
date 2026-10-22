@@ -308,6 +308,7 @@ s3://<bucket>/
   - **Writer role**, only when the token's `sub` is `repo:<org>/<repo>:ref:refs/heads/<default-branch>`: adds `PutObject`.
 - This enforces default-branch-only writes in IAM. A `pull_request` job's token carries `sub` `repo:<org>/<repo>:pull_request`, so a compromised pull-request build can't get the writer role.
 - Jobs triggered by `workflow_run` run in the default branch's context, so their tokens match the writer condition. GitHub doesn't document the `sub` for `pull_request_target`. Neither kind of workflow should run untrusted pull-request code with `id-token: write`.
+- A stricter condition customises the repository's subject claim template to include `event_name`, and requires `push` plus the default-branch ref for the writer role. Then neither `workflow_run` nor `pull_request_target` can match, whatever their `sub` looks like.
 - Repositories created after 15 July 2026 use an immutable `sub` by default, `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/<branch>`. The writer condition has to match that form for them.
 
 ### Encryption
@@ -627,15 +628,16 @@ The design doesn't depend on S3. What to cache, how to key it, when to write and
 **Simpler**
 
 - **Restore fallback.** `restore-keys` matches key prefixes, so the pointer objects aren't needed.
-- **Branch scoping.** A job reads its own branch's entries, then the default branch's, and a pull-request job also reads its base branch's. Entries written by a `pull_request` build are scoped to that pull request and are never visible to the default branch. That gives most of the poisoning protection the IAM roles give on S3, with one known gap: jobs triggered by `pull_request_target` or `workflow_run` run in the default branch's cache scope, so anything they write is restored by every branch. Those workflows must not run untrusted pull-request code before a cache save.
+- **Branch scoping and write trust.** A job reads its own branch's entries, then the default branch's, and a pull-request job also reads its base branch's. Entries written by a `pull_request` build are scoped to that pull request and are never visible to the default branch. Only `push`, `workflow_dispatch`, `repository_dispatch`, `delete`, `registry_package`, `page_build` and `schedule` runs can create or overwrite entries in the default branch's scope. Other runs that resolve to the default branch, including `pull_request_target`, `issue_comment` and `workflow_run`, can restore but not save. That protection is at least as strong as the IAM split on S3.
+- **`cache-mode` is the setting to check.** A workflow or job that declares `cache-mode: write` or `cache-mode: write-only` reopens the poisoning risk, and a called reusable workflow can request write access unless the caller sets `cache-mode: read`.
 - **Eviction.** Entries are evicted least recently used first, so frequently hit entries survive without a refresh step.
 - **Infrastructure.** There is no bucket, role, key or VPC endpoint to run.
 
 **Harder**
 
-- **Fine-grained entries.** Each entry is a separate upload or download through the cache API, entries can't be overwritten, and the service limits request rates. Thousands of per-file objects per job aren't practical, so entries have to be grouped, for example by hash prefix: finer than v5's bundles, coarser than one object per file.
+- **Fine-grained entries.** Each entry is a separate upload or download through the cache API, and entries can't be overwritten. Each repository is limited to 200 uploads and 1,500 downloads a minute, so restoring 3,000 objects uses two minutes of download quota and saving them uses 15 minutes of upload quota. Thousands of per-file objects per job aren't practical, so entries have to be grouped, for example by hash prefix: finer than v5's bundles, coarser than one object per file.
 - **Task outputs.** Gradle fetches task outputs over HTTP during the build, but the cache API is only reachable with the runner's own token. A local proxy is needed. [burrunan/gradle-cache-action](https://github.com/burrunan/gradle-cache-action) runs one, backed by the GitHub Actions cache.
-- **Size.** The default limit is 10 GB per repository, after which older entries are evicted. The harness repository passed it during the measured runs, and evictions turned warm runs cold. One basic entry for the Android build was 1.3 GB.
+- **Size.** The default limit is 10 GB per repository. Administrators can raise it, and usage above 10 GB is billed. Entries not accessed for 7 days are removed, and when the limit is reached the least recently accessed entries are evicted first. The harness repository passed it during the measured runs, and evictions turned warm runs cold. One basic entry for the Android build was 1.3 GB.
 - **Sharing.** Each repository has its own cache, so a dependency or task output built in one repository can't be reused by another.
 - **Self-hosted runners in AWS** reach the cache over the internet, which adds latency and, through a NAT gateway, data processing charges. From GitHub-hosted runners, restoring about 1.1 GB took 12–25 seconds.
 
@@ -651,9 +653,9 @@ Prices are approximate us-east-1 list prices for S3 Standard. Check the region y
 |---|---|
 | Into S3 (uploads) | Free |
 | S3 to EC2 or EKS runners in the same region | Free |
-| Same region, through a NAT gateway | NAT data processing, about $0.045/GB |
+| Same region, through a NAT gateway | NAT data processing, about $0.045/GB, plus about $0.045 per NAT gateway hour |
 | Same region, through an S3 gateway VPC endpoint | Free, with no hourly or per-GB charge |
-| Through an S3 interface endpoint (PrivateLink) | Hourly per AZ, plus about $0.01/GB |
+| Through an S3 interface endpoint (PrivateLink) | About $0.01 per endpoint-hour per AZ, plus about $0.01/GB |
 | S3 to runners in another region | About $0.02/GB |
 | Across AZs in the same region | None: S3 is regional |
 
@@ -663,7 +665,7 @@ The NAT gateway is the cost that catches people out. With runners in private sub
 
 | Item | Price | At the design's scale |
 |---|---|---|
-| GET | About $0.0004 per 1,000 | A few thousand objects per restore is about $0.001 per job. Missing keys answered with 403 are charged as GETs |
+| GET | About $0.0004 per 1,000 | A few thousand objects per restore is about $0.001 per job. Missing keys answered with 403 are charged as GETs, because the runner roles are in the bucket's own account |
 | PUT, COPY | About $0.005 per 1,000 | Only on default-branch saves, and only for objects that don't exist yet, plus refresh copies |
 | Storage | About $0.023 per GB-month | Bounded by lifecycle expiry |
 
@@ -673,7 +675,7 @@ AWS Key Management Service (KMS) holds encryption keys that never leave it. Othe
 - a key policy that limits which roles can decrypt, even if they can reach the bucket;
 - a CloudTrail record of every use of the key.
 
-Each object read or write can call KMS, at about $0.03 per 10,000 requests. **S3 Bucket Keys** cut most of those calls, because S3 uses a short-lived bucket-level key across many objects. SSE-S3 is a reasonable choice for a build cache. SSE-KMS is worth it when the cache may hold sensitive data, such as configuration cache entries, or when customer-managed keys are required.
+Each object read or write can call KMS, at about $0.03 per 10,000 requests after 20,000 free requests a month, plus about $1 per key per month. **S3 Bucket Keys** cut most of those calls, because S3 uses a short-lived bucket-level key across many objects. SSE-S3 is a reasonable choice for a build cache. SSE-KMS is worth it when the cache may hold sensitive data, such as configuration cache entries, or when customer-managed keys are required.
 
 ## Appendix C: EBS instead of S3
 
@@ -682,7 +684,7 @@ S3 doesn't always win over EBS. It depends on whether runners stay ephemeral. No
 | Option | How it works | Where it beats S3 | Where it loses |
 |---|---|---|---|
 | Persistent volume per runner | The disk survives between jobs, so Gradle User Home, `build/` and `.gradle/` are already warm | No restore step at all | Runners stop being ephemeral. Pull-request jobs write into the disk later jobs read, so default-branch-only writes can't be enforced. A volume attaches to one instance at a time, in one AZ, and grows until cleaned |
-| Volume from a pre-warmed snapshot, per job | Each runner starts from a snapshot with caches in it | No upload or download step in the job | Blocks load from S3 on first read, so the first build reads slowly. Fast Snapshot Restore avoids that, billed per snapshot, per AZ, per hour. The snapshot goes stale between rebuilds |
+| Volume from a pre-warmed snapshot, per job | Each runner starts from a snapshot with caches in it | No upload or download step in the job | Blocks load from S3 on first read (AWS calls this volume initialisation), so the first build reads slowly. Fast Snapshot Restore avoids that, at about $0.75 per snapshot per AZ per hour with a one-hour minimum. A provisioned initialisation rate, set when the volume is created, is the other option. The snapshot goes stale between rebuilds |
 | Caches baked into the AMI | As above, refreshed when the image is rebuilt | Free at job time for layers that rarely change | The same first-read cost, and only as fresh as the last image build |
 
 S3 is the better fit for:
@@ -691,7 +693,7 @@ S3 is the better fit for:
 - write trust enforced by IAM;
 - task outputs, which need a remote build cache service that other runners can reach during the build.
 
-A shared filesystem such as EFS could serve several runners. Concurrent builds on one machine can share a Gradle User Home, because Gradle locks its caches, but a writable Gradle User Home shared between machines over NFS or EFS is not supported, and small-file I/O over NFS is slow. The supported way to share dependencies is read-only, through `GRADLE_RO_DEP_CACHE`.
+A shared filesystem such as EFS could serve several runners. Gradle supports concurrent use of one dependency cache only when the Gradle processes can communicate with each other, which is usually not the case across machines or containers, and small-file I/O over NFS is slow. The supported way to share dependencies is read-only, through `GRADLE_RO_DEP_CACHE`.
 
 Storage cost also differs: S3 is about $0.023/GB-month for one shared copy, and EBS gp3 is about $0.08/GB-month for every runner's volume.
 
