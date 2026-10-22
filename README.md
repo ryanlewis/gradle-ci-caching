@@ -4,7 +4,7 @@ A study of what Gradle caching on GitHub Actions could look like at its best, fo
 
 The two builds, an Android app and a Spring Boot API server, ran under three existing options:
 
-- **basic**: `gradle/actions/setup-gradle` v6 with `cache-provider: basic`. It is often paired with [burrunan/gradle-s3-build-cache](https://github.com/burrunan/gradle-s3-build-cache) for task outputs (called **Basic + S3** below). That pairing was not measured: no S3 bucket was used, and the measured basic variant keeps task outputs in the local build cache inside its Gradle User Home tarball.
+- **basic**: `gradle/actions/setup-gradle` v6 with `cache-provider: basic`. It is often paired with [burrunan/gradle-s3-build-cache](https://github.com/burrunan/gradle-s3-build-cache) for task outputs (called **Basic + S3** below). That pairing was not measured: no S3 bucket was used, and the measured basic variant keeps task outputs in the local build cache inside its tarball of `caches/` and `wrapper/`.
 - **Enhanced**: `gradle/actions/setup-gradle` v6 with its default provider, the closed-source `gradle-actions-caching` library.
 - **v5**: `gradle/actions/setup-gradle` v5.0.2, the last release whose fine-grained caching is open source (MIT).
 
@@ -32,12 +32,12 @@ There is no implementation. The ideal design is a reference point for the measur
 2. **Task outputs in their own store, not in Gradle User Home.** Per-job cleanup of Gradle User Home deletes task outputs the current job didn't use. Switching back to an earlier dependency set then rebuilds work that had already been cached. A separate content-addressed store, expired by age, keeps it. *sim* confirmed this on Android: going back to the original versions, it got 316 tasks from cache, against 302 for v5 and Enhanced.
 3. **Fine-grained, content-addressed entries.** A one-library bump added 10 MB of new dependency and transform files on Android. v5 and Enhanced re-uploaded 940 MB of bundles.
 4. **Project state for the configuration cache.** The configuration cache is reused across commits, including source-only edits, but only if three things hold:
-   - the runner image is the same;
+   - the runner's kernel release is the same (Gradle checks `os.version`);
    - the included `build-logic` build's outputs are restored;
    - files the build generates inside the source tree are restored.
 
    Without these, the first Gradle call in a fresh checkout never reuses it. It's worth about 18 seconds per warm Android build.
-5. **Build conventions.** These matter most where caching can't help: parallel execution, Spring's dependency-management plugin, and tasks that are deliberately uncacheable. On Android the ~230 uncacheable tasks cost about 18 seconds in total, so they aren't worth chasing.
+5. **Build conventions.** These matter most where caching can't help: parallel execution, Spring's dependency-management plugin, and tasks that are deliberately uncacheable. On Android the ~230 uncacheable tasks cost 7–11 seconds per warm build, so they aren't worth chasing.
 
 Enhanced adds two things over the open v5 code:
 - the local build cache stored as its own entry;
@@ -70,7 +70,7 @@ Runs before and after the build steps, because Gradle User Home and project stat
 | Does | Detail |
 |---|---|
 | Restores Gradle User Home | Reads a pointer for the closest scope (repo → branch → OS/arch → job → matrix), falls back to broader scopes and then the default branch, then fetches the manifest's content-addressed blobs in parallel |
-| Restores project state | Configuration cache directories, the included build's outputs and declared generated paths, keyed by build-logic inputs **and the runner image** |
+| Restores project state | Configuration cache directories, the included build's outputs and declared generated paths, keyed by build-logic inputs **and the kernel release** (`uname -r`, which Gradle checks as `os.version`) |
 | Configures Gradle | Writes an init script that applies the settings plugin and turns the local build cache off. Exports `GRADLE_ENCRYPTION_KEY` from the secret store |
 | Saves (default branch only) | Stops daemons, runs Gradle's cache cleanup with the build's own distribution, uploads only blobs that don't exist yet, writes the manifest and pointer |
 | Reports | Job summary plus metrics: restore and save time, bytes, hits and misses per layer, configuration cache hit and miss reason |
@@ -81,9 +81,9 @@ Replaces burrunan, keeping what it does well and adding what's missing.
 
 | Keeps from burrunan | Adds |
 |---|---|
-| One `GetObject` per lookup, no `ListBucket` | Credentials from GitHub OIDC roles (reader everywhere, writer only on the default branch) |
+| One `GetObject` per lookup, no `ListBucket`, 403 treated as a miss | Credentials from GitHub OIDC roles (reader everywhere, writer only on the default branch) |
 | Streams files, no buffering | Applies to included builds (`build-logic`) as well |
-| `maximumCachedObjectLength` cap | Refreshes hot objects so age-based expiry doesn't evict them (see [Eviction](#eviction)) |
+| `maximumCachedObjectLength` cap | Refreshes hot objects from default-branch jobs so age-based expiry doesn't evict them (see [Eviction](#eviction)) |
 | KMS encryption | Per-build metrics: hits, misses, time saved, bytes |
 | Per-entry metadata (task, execution time) | Push only where the writer role is available, decided by credentials and not by a flag |
 
@@ -186,12 +186,12 @@ v5 provisions a separate Gradle distribution for this. Its save steps took 9–4
 
   | Reason given by Gradle | Cause | Ideal design's answer |
   |---|---|---|
-  | `system property 'os.version' has changed` | The job ran on a different runner image or kernel than the job that stored the entry | Include the runner image ID in the project-state key. On self-hosted runners, keep AMIs pinned |
+  | `system property 'os.version' has changed` | The job ran on a runner with a different kernel release than the job that stored the entry. In the measured runs this mostly followed the two runner image versions, but not always: one *sim* run reused an entry stored on the other image | Include the kernel release in the project-state key (untested: *sim*'s key did not include it). On self-hosted runners, keep AMIs pinned |
   | `an input to task ':build-logic:convention:processResources' has changed` | The included build's outputs (generated plugin descriptors) don't exist on a fresh checkout | Restore `build-logic/*/build/` as project state |
   | `the file system entry 'app/src/demoRelease/generated/baselineProfiles' has been removed` | A plugin generates files into the source tree, which a fresh checkout doesn't have | Restore declared generated paths as project state, or move generation under `build/` |
   | Any build-file or version-catalogue change | Expected | None needed |
 
-  With all three in place (*sim*), the first Gradle call in a fresh checkout reused the configuration cache on a source-only commit: `help` took 7–8 s, against 11–20 s for the other providers. Reuse in a later call of the same job took a warm Android build from 34–40 s to 17 s.
+  With `build-logic` outputs and generated paths restored (*sim*), and the kernel release matching, the first Gradle call in a fresh checkout reused the configuration cache on a source-only commit: `help` took 7–8 s, against 11–20 s for the other providers. Reuse in a later call of the same job took a warm Android build from 34–40 s to 17 s.
 
 ### Remote build cache (task outputs)
 
@@ -207,7 +207,7 @@ flowchart LR
 ```
 
 - On CI, the local build cache is off. Enhanced and v5 keep it in Gradle User Home, where cleanup purges whatever the current job didn't use.
-- Reads are one `GetObject` per key, with a 404 meaning a miss.
+- Reads are one `GetObject` per key. With only `s3:GetObject`, S3 returns 403 Access Denied for a missing key, not 404, so the plugin treats 403 as a miss, as burrunan does. Granting `s3:ListBucket` on the task-cache prefix turns misses into 404s.
 - Per-entry metadata (task path, execution time) makes time saved measurable.
 
 ### Build logic
@@ -224,13 +224,13 @@ s3://<bucket>/
   home/blobs/<type>/<content-key>                          # dependency files, transforms, DSL caches, wrappers, JDKs
   home/manifests/<repo>/<home-key>                         # home entry: blob list + small files
   home/refs/<repo>/<branch>/<os-arch>/<job>/<matrix>       # pointer → latest manifest for this scope
-  project-state/<repo>/<image>/<build-logic-hash>/<sha>    # configuration cache, build-logic outputs, generated paths
-  project-state/refs/<repo>/<branch>/<image>/<build-logic-hash>
+  project-state/<repo>/<kernel>/<build-logic-hash>/<sha>   # configuration cache, build-logic outputs, generated paths
+  project-state/refs/<repo>/<branch>/<kernel>/<build-logic-hash>
 ```
 
 - **Content-addressed objects can be shared across repositories.** Same key means same content, so collisions are not a risk. Who can write is, which is a tenancy decision (see [Open questions](#open-questions)).
 - **Pointers instead of listing.** Restore never needs `ListBucket`.
-- **Project state is per repo, image and build-logic hash.** It is only valid when all three match.
+- **Project state is per repo, kernel release and build-logic hash.** It is only valid when all three match.
 
 ### Transfer
 
@@ -244,7 +244,7 @@ s3://<bucket>/
 - S3 lifecycle rules expire by age since creation, not last access.
 - Task cache and blobs:
   - a generous expiry (14–30 days);
-  - the plugin refreshes an object (in-place `CopyObject`) when it is hit and older than half the expiry, so hot entries never expire.
+  - the plugin refreshes an object when it is hit and older than half the expiry, so hot entries never expire. The refresh is an in-place `CopyObject`, which needs `x-amz-metadata-directive: REPLACE` (S3 rejects a plain self-copy) and `PutObject`. Only default-branch jobs have the writer role, so entries hit only by pull-request builds still age out.
 - Shorter expiry for `refs/`, `manifests/` and `project-state/`, since a stale pointer only costs a fallback.
 
 ### Write trust
@@ -253,6 +253,7 @@ s3://<bucket>/
   - **Reader role**, available to every job: `GetObject`.
   - **Writer role**, only when the token's `sub` is `repo:<org>/<repo>:ref:refs/heads/<default-branch>`: adds `PutObject`.
 - This enforces default-branch-only writes in IAM. A compromised pull-request build can't poison the cache.
+- Repositories created after 15 July 2026 use an immutable `sub` by default, `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/<branch>`. The writer condition has to match that form for them.
 
 ### Encryption
 
@@ -285,7 +286,7 @@ The convention plugin applies these and reports what it can't fix.
 
 ### Android
 
-- Leave AGP's uncacheable tasks alone. About 230 tasks run even on a fully warm build ("Simple merging task", "Caching has been disabled for the task"), but together they cost about 18 seconds.
+- Leave AGP's uncacheable tasks alone. About 230 tasks run even on a fully warm build ("Simple merging task", "Caching has been disabled for the task"), but together they cost 7–11 seconds per warm build (18–61 s on the two cold builds traced).
 - Remove `android.enableJetifier=true` once no dependency needs it.
 - `android.nonTransitiveRClass=true`.
 - Keep AGP and Kotlin versions aligned across modules, so transforms are shared.
@@ -313,7 +314,7 @@ The convention plugin applies these and reports what it can't fix.
 | **Deduplication** | None | Per-type bundles + local build cache entry | Per-type bundles | Per-object, content-addressed |
 | **Cleanup** | None | Unused-since-job-start | Same, with a downloaded Gradle | Same, with the build's Gradle |
 | **Task outputs** | S3 (burrunan) | Local build cache entry, cleaned per job | Inside the home entry, cleaned per job | S3, refreshed on hit |
-| **Configuration cache** | Not restored | Develocity licence only | Restored (needs encryption key) | Restored with project state, image-keyed |
+| **Configuration cache** | Not restored | Develocity licence only | Restored (needs encryption key) | Restored with project state, keyed by kernel release |
 | **Build-logic outputs** | Not restored | Develocity licence only | Not restored | Restored as project state |
 | **Write trust** | Default branch by convention | Default branch by convention | Default branch by convention | Default branch enforced by IAM |
 | **Vendor calls** | None | None observed; docs reserve "metadata" | None | None |
@@ -383,7 +384,7 @@ Each cell is a single run, and repeated cold runs varied by about ±30%, so only
 |  | v5 | 610 | 19 | 19 | 50 | 14 | reused | 307 / 547 |
 |  | sim | 601 | 15 | 7 | 49 | 14 | reused | 307 / 547 |
 
-Build-file edit:
+Build-file edit, from a separate run of the harness without *sim*:
 
 | Scenario | Provider | Image | Restore | Configure | Build | Save | Config cache | Build from cache |
 |---|---|---|---|---|---|---|---|---|
@@ -414,6 +415,8 @@ Build-file edit:
 | Back to original versions | enhanced | 601 | 10 | 16 | 47 | 47 | 10 | off | 99 / 357 | 3 / 15 |
 |  | v5 | 601 | 9 | 13 | 32 | 39 | 23 | off | 99 / 357 | 3 / 15 |
 |  | v5rc | 601 | 6 | 12 | 32 | 3 | 20 | off | 104 / 357 | 7 / 15 |
+
+basic is left out of "Back to original versions": the repository's GitHub Actions cache had passed its 10 GB limit, basic's entry was evicted, and it ran cold.
 
 Source edits for this build, with tests, are in the parallel table below.
 
@@ -448,7 +451,7 @@ On a source edit in `core`, the core module's tests re-run (32–48 s) and the r
 
 From Gradle's build operation traces. Wall-clock time per category merges overlapping operations, so parallel work isn't counted twice.
 
-**Android, cold build (v5, 264 s wall clock)**
+**Android, cold build (v5, 264 s wall clock).** This trace is from a separate cold run of the same build; the cold row in the table above is a different run (312 s).
 
 | Category | Wall clock | Summed | Operations |
 |---|---|---|---|
@@ -469,15 +472,15 @@ From Gradle's build operation traces. Wall-clock time per category merges overla
 | Enhanced | 34 s | 11 s configuring 47 projects, 3 s storing | 14 s |
 | basic | 40 s | 13 s configuring, 3 s storing | 15 s |
 
-Of the 13–15 s running tasks, about 6 s is the uncacheable tasks and about 2.5 s is unpacking 368 cache entries.
+Of the 13–15 s running tasks, about 7 s is the uncacheable tasks and about 2.5 s is unpacking 368 cache entries.
 
 **Android, tasks that never come from cache**
 
-| Reason Gradle gives | Tasks | Time on a cold build |
-|---|---|---|
-| "Caching has been disabled for the task" | 105 | 15.7 s |
-| "Simple merging task" | 117 | 2.3 s |
-| Other | 11 | 0.3 s |
+| Reason Gradle gives | Tasks | Warm and source-edit builds (4 traces) | Cold builds (2 traces) |
+|---|---|---|---|
+| "Caching has been disabled for the task" | 105 | 5.1–7.4 s | 15.7–24.9 s |
+| "Simple merging task" | 117 | 2.1–3.3 s | 2.3–36.5 s |
+| Other | 2–11 | 0.3–0.5 s | 0.3 s |
 
 **Spring Boot, cold build (v5, 193 s wall clock)**
 
@@ -510,10 +513,10 @@ New files in Gradle User Home after one library version change, against what the
 
 | Entry | Size (compressed) |
 |---|---|
-| Basic: whole Gradle User Home | 1,338 MB |
+| Basic: `caches/` and `wrapper/` tarball | 1,338 MB |
 | Dependencies bundle | 532 MB |
 | Transforms bundle | 410 MB |
-| Local build cache entry (Enhanced) | 36–200 MB |
+| Local build cache entry (Enhanced) | 30–200 MB |
 | Wrapper distribution | 144 MB |
 | Generated Gradle API jars | 42 MB |
 | Configuration cache, per project (v5) | 2.7 MB |
