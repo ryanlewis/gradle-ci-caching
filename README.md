@@ -65,6 +65,54 @@ flowchart TB
     A2 -->|"PutObject (writer role, default branch)"| S3
 ```
 
+### Example workflow
+
+There is no implementation, so this example is illustrative: the action name `<owner>/gradle-s3-cache` and its inputs are placeholders. It shows what a repository would write.
+
+```yaml
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC token, exchanged for the S3 reader or writer role
+    steps:
+      - uses: actions/checkout@<sha> # vX.Y.Z
+
+      - uses: actions/setup-java@<sha> # vX.Y.Z
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Replaces gradle/actions/setup-gradle. Restores Gradle User Home and project state from S3,
+      # applies the S3 build cache and convention plugins through an init script, and saves after the job.
+      - uses: <owner>/gradle-s3-cache@<sha> # vX.Y.Z
+        with:
+          bucket: ci-gradle-cache
+          region: eu-west-2
+          reader-role: arn:aws:iam::123456789012:role/gradle-cache-reader
+          # Assumed only when the job runs on the default branch; the role's trust policy enforces it
+          writer-role: arn:aws:iam::123456789012:role/gradle-cache-writer
+          encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          # Paths the build generates inside the source tree, restored as project state
+          generated-paths: |
+            app/src/*/generated
+
+      - run: ./gradlew build
+```
+
+The repository's own build scripts don't change. The `buildCache {}` block, the local build cache switch and the conventions all come from the init script the action writes. On a pull request the job gets the reader role only, so it restores and reads from S3 but never writes.
+
 ### 1. Setup action
 
 Runs before and after the build steps, because Gradle User Home and project state must be on disk before Gradle starts and saved after the daemon stops. A Gradle plugin can't do this.
