@@ -4,7 +4,7 @@ A study of what Gradle caching on GitHub Actions could look like at its best, fo
 
 The two builds, an Android app and a Spring Boot API server, ran under three existing options:
 
-- **Basic + S3**: `gradle/actions/setup-gradle` v6 with `cache-provider: basic`, plus [burrunan/gradle-s3-build-cache](https://github.com/burrunan/gradle-s3-build-cache) for task outputs.
+- **basic**: `gradle/actions/setup-gradle` v6 with `cache-provider: basic`. It is often paired with [burrunan/gradle-s3-build-cache](https://github.com/burrunan/gradle-s3-build-cache) for task outputs (called **Basic + S3** below). That pairing was not measured: no S3 bucket was used, and the measured basic variant keeps task outputs in the local build cache inside its Gradle User Home tarball.
 - **Enhanced**: `gradle/actions/setup-gradle` v6 with its default provider, the closed-source `gradle-actions-caching` library.
 - **v5**: `gradle/actions/setup-gradle` v5.0.2, the last release whose fine-grained caching is open source (MIT).
 
@@ -28,7 +28,7 @@ There is no implementation. The ideal design is a reference point for the measur
 
 ## Findings, ranked by measured value
 
-1. **Restore fallback for Gradle User Home.** After a build-file or version-catalogue edit, a cache keyed on build files (basic) starts empty. That costs about 7 minutes on the Android build and about 5.5 minutes on the Spring Boot build. Falling back to the nearest earlier entry costs 40–90 seconds.
+1. **Restore fallback for Gradle User Home.** After a build-file or version-catalogue edit, a cache keyed on build files (basic) starts empty. Measured with basic alone, that costs about 7 minutes on the Android build and about 5.5 minutes on the Spring Boot build. Falling back to the nearest earlier entry costs 40–90 seconds. With an S3 build cache beside basic, task outputs would survive the edit and the cost would be lower; that was not measured.
 2. **Task outputs in their own store, not in Gradle User Home.** Per-job cleanup of Gradle User Home deletes task outputs the current job didn't use. Switching back to an earlier dependency set then rebuilds work that had already been cached. A separate content-addressed store, expired by age, keeps it. *sim* confirmed this on Android: going back to the original versions, it got 316 tasks from cache, against 302 for v5 and Enhanced.
 3. **Fine-grained, content-addressed entries.** A one-library bump added 10 MB of new dependency and transform files on Android. v5 and Enhanced re-uploaded 940 MB of bundles.
 4. **Project state for the configuration cache.** The configuration cache is reused across commits, including source-only edits, but only if three things hold:
@@ -304,7 +304,7 @@ The convention plugin applies these and reports what it can't fix.
 
 ## Comparison with existing options
 
-| Capability | Basic + S3 | Enhanced | v5 | Ideal |
+| Capability | Basic + S3 (not measured) | Enhanced | v5 | Ideal |
 |---|---|---|---|---|
 | **Licence** | MIT + Apache 2.0 | Closed, Gradle Terms of Use | MIT | Open source, no vendor component |
 | **Storage** | GitHub cache (home), S3 (task outputs) | GitHub cache | GitHub cache | S3, in-region |
@@ -317,6 +317,8 @@ The convention plugin applies these and reports what it can't fix.
 | **Build-logic outputs** | Not restored | Develocity licence only | Not restored | Restored as project state |
 | **Write trust** | Default branch by convention | Default branch by convention | Default branch by convention | Default branch enforced by IAM |
 | **Vendor calls** | None | None observed; docs reserve "metadata" | None | None |
+
+The Basic + S3 column describes that pairing from documentation and burrunan's options. The measurements use basic alone.
 
 Enhanced's Gradle User Home caching is the v5 design with the protocol bumped to `v2`. It uses the same key scheme, fallback, entry types and cleanup, and it honours v5's environment variables. Enhanced is free for public repositories and a "Free Preview" for private ones, with usage-based pricing planned for large commercial organisations.
 
@@ -346,6 +348,7 @@ Each cell is a single run, and repeated cold runs varied by about ±30%, so only
   - **Configure** is `./gradlew help`, the first Gradle call in the job.
   - **Build** and **Test** are the later calls.
   - **Save** is the provider's post step.
+- **basic** is `cache-provider: basic` alone, with no S3 build cache. Its task outputs come only from the local build cache inside its Gradle User Home tarball.
 - **Image** is the last part of the runner image version (`20261012.601` or `20261015.610`).
 - **Config cache** is the outcome of the build step, with Gradle's own reason for a miss.
 - **sim** (Android) is v5 plus two additions: a separate task output store that is never cleaned per job, and restored project state (`build-logic` outputs and `src/*/generated` paths), keyed by build-logic inputs.
