@@ -27,6 +27,10 @@ The study was built with AI assistance: Claude Opus 5.5 built the harness, and C
 - [Judging an implementation](#judging-an-implementation)
 - [Open questions](#open-questions)
 - [Sources](#sources)
+- [Appendix A: The GitHub Actions cache as the backend](#appendix-a-the-github-actions-cache-as-the-backend)
+- [Appendix B: AWS transfer, request and key costs](#appendix-b-aws-transfer-request-and-key-costs)
+- [Appendix C: EBS instead of S3](#appendix-c-ebs-instead-of-s3)
+- [Appendix D: How the harness observes Enhanced](#appendix-d-how-the-harness-observes-enhanced)
 
 ## Findings, ranked by measured value
 
@@ -602,7 +606,7 @@ An implementation of this design would only be worth its maintenance cost if it 
 - **Object granularity.** Per dependency file vs per group, and per transform directory. Request overhead against upload savings.
 - **S3 restore speed** from an in-region bucket, compared with 12–25 seconds from GitHub's storage.
 - **Generated paths in the source tree.** Declared per repo, or discovered by diffing the checkout before and after the build.
-- **Runner image vs restore.** Which layers (wrapper, JDKs, a base dependency set via `GRADLE_RO_DEP_CACHE`) belong in the AMI instead.
+- **Runner image vs restore.** Which layers (wrapper, JDKs, a base dependency set via `GRADLE_RO_DEP_CACHE`) belong in the AMI instead. See [Appendix C](#appendix-c-ebs-instead-of-s3).
 - **Kotlin DSL Spring Boot builds.** The Spring Boot build measured uses the Groovy DSL. Kotlin DSL script compilation would add a configuration cost similar to the Android build's.
 
 ## Sources
@@ -614,3 +618,96 @@ An implementation of this design would only be worth its maintenance cost if it 
 | `gradle-actions-caching` (vendored in v6) | Proprietary | Not read or unpacked; the Terms of Use forbid decompiling or reverse engineering. Observed from outside only |
 | `burrunan/gradle-s3-build-cache` | Apache 2.0 | README and configuration options |
 | Gradle user manual | | Gradle User Home layout, cache cleanup, build cache, configuration cache, read-only dependency cache |
+
+## Appendix A: The GitHub Actions cache as the backend
+
+The design doesn't depend on S3. What to cache, how to key it, when to write and which conventions to apply all carry over to the GitHub Actions cache, which v5 and Enhanced already use. Some parts get simpler and some get harder.
+
+**Simpler**
+
+- **Restore fallback.** `restore-keys` matches key prefixes, so the pointer objects aren't needed.
+- **Branch scoping.** A job reads its own branch's entries, then the default branch's. Entries written by a pull-request build are scoped to that pull request and are never visible to the default branch. That gives most of the poisoning protection the IAM roles give on S3.
+- **Eviction.** Entries are evicted least recently used first, so frequently hit entries survive without a refresh step.
+- **Infrastructure.** There is no bucket, role, key or VPC endpoint to run.
+
+**Harder**
+
+- **Fine-grained entries.** Each entry is a separate upload or download through the cache API, entries can't be overwritten, and the service limits request rates. Thousands of per-file objects per job aren't practical, so entries have to be grouped, for example by hash prefix: finer than v5's bundles, coarser than one object per file.
+- **Task outputs.** Gradle fetches task outputs over HTTP during the build, but the cache API is only reachable with the runner's own token. A local proxy is needed. [burrunan/gradle-cache-action](https://github.com/burrunan/gradle-cache-action) runs one, backed by the GitHub Actions cache.
+- **Size.** The default limit is 10 GB per repository, after which older entries are evicted. The harness repository passed it during the measured runs, and evictions turned warm runs cold. One basic entry for the Android build was 1.3 GB.
+- **Sharing.** Each repository has its own cache, so a dependency or task output built in one repository can't be reused by another.
+- **Self-hosted runners in AWS** reach the cache over the internet, which adds latency and, through a NAT gateway, data processing charges. From GitHub-hosted runners, restoring about 1.1 GB took 12–25 seconds.
+
+For GitHub-hosted runners, the GitHub Actions cache is the natural backend. For self-hosted runners in AWS serving many repositories, S3 is closer, can be shared across repositories, and has no fixed size limit.
+
+## Appendix B: AWS transfer, request and key costs
+
+Prices are approximate us-east-1 list prices for S3 Standard. Check the region you use.
+
+**Data transfer**
+
+| Path | Charge |
+|---|---|
+| Into S3 (uploads) | Free |
+| S3 to EC2 or EKS runners in the same region | Free |
+| Same region, through a NAT gateway | NAT data processing, about $0.045/GB |
+| Same region, through an S3 gateway VPC endpoint | Free, with no hourly or per-GB charge |
+| Through an S3 interface endpoint (PrivateLink) | Hourly per AZ, plus about $0.01/GB |
+| S3 to runners in another region | About $0.02/GB |
+| Across AZs in the same region | None: S3 is regional |
+
+The NAT gateway is the cost that catches people out. With runners in private subnets and no gateway endpoint, S3 traffic goes through NAT. At about 1 GB restored per Android job, 1,000 jobs a day cost roughly $45 a day in NAT processing alone. A gateway endpoint and a route table entry bring that to zero.
+
+**Requests and storage**
+
+| Item | Price | At the design's scale |
+|---|---|---|
+| GET | About $0.0004 per 1,000 | A few thousand objects per restore is about $0.001 per job. Missing keys answered with 403 are charged as GETs |
+| PUT, COPY | About $0.005 per 1,000 | Only on default-branch saves, and only for objects that don't exist yet, plus refresh copies |
+| Storage | About $0.023 per GB-month | Bounded by lifecycle expiry |
+
+**Keys (KMS)**
+
+AWS Key Management Service (KMS) holds encryption keys that never leave it. Other services ask it to encrypt or decrypt with them. With SSE-KMS, S3 encrypts each object with a KMS key you control. Compared with the default SSE-S3 (AWS-managed keys, no charge), this adds:
+- a key policy that limits which roles can decrypt, even if they can reach the bucket;
+- a CloudTrail record of every use of the key.
+
+Each object read or write can call KMS, at about $0.03 per 10,000 requests. **S3 Bucket Keys** cut most of those calls, because S3 uses a short-lived bucket-level key across many objects. SSE-S3 is a reasonable choice for a build cache. SSE-KMS is worth it when the cache may hold sensitive data, such as configuration cache entries, or when customer-managed keys are required.
+
+## Appendix C: EBS instead of S3
+
+S3 doesn't always win over EBS. It depends on whether runners stay ephemeral. None of the EBS options were measured.
+
+| Option | How it works | Where it beats S3 | Where it loses |
+|---|---|---|---|
+| Persistent volume per runner | The disk survives between jobs, so Gradle User Home, `build/` and `.gradle/` are already warm | No restore step at all | Runners stop being ephemeral. Pull-request jobs write into the disk later jobs read, so default-branch-only writes can't be enforced. A volume attaches to one instance at a time, in one AZ, and grows until cleaned |
+| Volume from a pre-warmed snapshot, per job | Each runner starts from a snapshot with caches in it | No upload or download step in the job | Blocks load from S3 on first read, so the first build reads slowly. Fast Snapshot Restore avoids that, billed per snapshot, per AZ, per hour. The snapshot goes stale between rebuilds |
+| Caches baked into the AMI | As above, refreshed when the image is rebuilt | Free at job time for layers that rarely change | The same first-read cost, and only as fresh as the last image build |
+
+S3 is the better fit for:
+- ephemeral runners;
+- sharing across runners, AZs and repositories;
+- write trust enforced by IAM;
+- task outputs, which need a remote build cache service that other runners can reach during the build.
+
+A shared filesystem such as EFS could serve several runners, but Gradle warns against sharing a Gradle User Home between concurrent builds, and small-file I/O over NFS is slow. The supported way to share dependencies is read-only, through `GRADLE_RO_DEP_CACHE`.
+
+Storage cost also differs: S3 is about $0.023/GB-month for one shared copy, and EBS gp3 is about $0.08/GB-month for every runner's volume.
+
+The likely best combination is both:
+- layers that rarely change in the AMI or snapshot: wrapper distributions, JDKs, and a base dependency set through `GRADLE_RO_DEP_CACHE`;
+- layers that change in S3: transforms, Kotlin DSL caches, project state and task outputs.
+
+Snapshot-backed volumes would be worth measuring, because the first-read cost falls on Gradle's many small random reads.
+
+## Appendix D: How the harness observes Enhanced
+
+The closed `gradle-actions-caching` library is never unpacked: Gradle's Terms of Use forbid decompiling or reverse engineering it. Everything said about Enhanced comes from what it leaves behind:
+
+- **Cache keys and entries.** Enhanced's home keys have v5's shape with the protocol bumped, `gradle-home-v2|<os>-<arch>|<job>[<hash>]-<sha>` against v5's `-v1`. It writes the same extracted entry types plus the local build cache (`gradle-build-cache-v2-…`), and it honours v5's `GRADLE_BUILD_ACTION_CACHE_KEY_PREFIX` variable.
+- **Its debug log.** With setup-gradle's cache debug logging on, it prints the keys it restores and saves, and how long each took.
+- **The open code around it.** The MIT-licensed parts of v6 define the interface the library implements and the statuses it can report, including that project state needs a Develocity licence or trial. No Enhanced run saved configuration cache entries, which matches.
+- **Behaviour across scenarios.** Running the same sequence under v5 and Enhanced shows they fall back, clean up and lose task outputs in the same way.
+- **Network.** DNS lookups and new connections are recorded for the whole job. A small local action starts the capture before setup-gradle runs, and its post step runs after setup-gradle's (GitHub runs post steps in reverse order), so the capture covers the save phase. Enhanced contacted only GitHub, its cache storage and the build's own repositories.
+
+This shows what Enhanced does, not how. Anything that leaves no trace in keys, entries, logs or network traffic would not be visible.
