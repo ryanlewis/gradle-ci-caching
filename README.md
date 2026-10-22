@@ -12,6 +12,8 @@ A fourth variant, **sim**, adds parts of the ideal design to v5 to test its main
 
 There is no implementation. The ideal design is a reference point for the measurements. The measurement harness is [gradle-cache-harness](https://github.com/ryanlewis/gradle-cache-harness).
 
+The study was built with AI assistance: Claude Opus 5.5 built the harness, and Claude Fable 5.1 verified the results.
+
 ## Contents
 
 - [Findings, ranked by measured value](#findings-ranked-by-measured-value)
