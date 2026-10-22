@@ -306,7 +306,8 @@ s3://<bucket>/
 - Instance profiles can't tell a default-branch job from a pull-request job. Use GitHub OIDC:
   - **Reader role**, available to every job: `GetObject`.
   - **Writer role**, only when the token's `sub` is `repo:<org>/<repo>:ref:refs/heads/<default-branch>`: adds `PutObject`.
-- This enforces default-branch-only writes in IAM. A compromised pull-request build can't poison the cache.
+- This enforces default-branch-only writes in IAM. A `pull_request` job's token carries `sub` `repo:<org>/<repo>:pull_request`, so a compromised pull-request build can't get the writer role.
+- Jobs triggered by `workflow_run` run in the default branch's context, so their tokens match the writer condition. GitHub doesn't document the `sub` for `pull_request_target`. Neither kind of workflow should run untrusted pull-request code with `id-token: write`.
 - Repositories created after 15 July 2026 use an immutable `sub` by default, `repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/<branch>`. The writer condition has to match that form for them.
 
 ### Encryption
@@ -626,7 +627,7 @@ The design doesn't depend on S3. What to cache, how to key it, when to write and
 **Simpler**
 
 - **Restore fallback.** `restore-keys` matches key prefixes, so the pointer objects aren't needed.
-- **Branch scoping.** A job reads its own branch's entries, then the default branch's. Entries written by a pull-request build are scoped to that pull request and are never visible to the default branch. That gives most of the poisoning protection the IAM roles give on S3.
+- **Branch scoping.** A job reads its own branch's entries, then the default branch's, and a pull-request job also reads its base branch's. Entries written by a `pull_request` build are scoped to that pull request and are never visible to the default branch. That gives most of the poisoning protection the IAM roles give on S3, with one known gap: jobs triggered by `pull_request_target` or `workflow_run` run in the default branch's cache scope, so anything they write is restored by every branch. Those workflows must not run untrusted pull-request code before a cache save.
 - **Eviction.** Entries are evicted least recently used first, so frequently hit entries survive without a refresh step.
 - **Infrastructure.** There is no bucket, role, key or VPC endpoint to run.
 
@@ -690,7 +691,7 @@ S3 is the better fit for:
 - write trust enforced by IAM;
 - task outputs, which need a remote build cache service that other runners can reach during the build.
 
-A shared filesystem such as EFS could serve several runners, but Gradle warns against sharing a Gradle User Home between concurrent builds, and small-file I/O over NFS is slow. The supported way to share dependencies is read-only, through `GRADLE_RO_DEP_CACHE`.
+A shared filesystem such as EFS could serve several runners. Concurrent builds on one machine can share a Gradle User Home, because Gradle locks its caches, but a writable Gradle User Home shared between machines over NFS or EFS is not supported, and small-file I/O over NFS is slow. The supported way to share dependencies is read-only, through `GRADLE_RO_DEP_CACHE`.
 
 Storage cost also differs: S3 is about $0.023/GB-month for one shared copy, and EBS gp3 is about $0.08/GB-month for every runner's volume.
 
